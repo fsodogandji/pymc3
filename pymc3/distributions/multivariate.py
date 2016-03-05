@@ -12,6 +12,8 @@ from .distribution import Continuous, Discrete, draw_values, generate_samples
 from .special import gammaln, multigammaln
 from .dist_math import bound, logpow, factln
 
+from ..theanof import logabsdet
+
 __all__ = ['MvNormal', 'Dirichlet', 'Multinomial', 'Wishart', 'LKJCorr']
 
 
@@ -65,7 +67,7 @@ class MvNormal(Continuous):
         delta = value - mu
         k = tau.shape[0]
 
-        result = k * T.log(2 * np.pi) + T.log(1./det(tau))
+        result = k * T.log(2 * np.pi) - logabsdet(tau)
         result += (delta.dot(tau) * delta).sum(axis=delta.ndim - 1)
         return -1/2. * result
 
@@ -387,7 +389,7 @@ class LKJCorr(Continuous):
         X = T.fill_diagonal(X, 1)
 
         result = self._normalizing_constant(n, p)
-        result += (n - 1.) * T.log(det(X))
+        result += (n - 1.) * logabsdet(X)
         return bound(result,
                      T.all(X <= 1), T.all(X >= -1),
                      matrix_pos_def(X),
