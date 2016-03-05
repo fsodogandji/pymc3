@@ -244,7 +244,7 @@ class LogAbsDet(Op):
     def grad(self, inputs, g_outputs):
         gz, = g_outputs
         x, = inputs
-        return [gz * T.nlinalg.matrix_inverse(x).T]
+        return [gz * t.nlinalg.matrix_inverse(x).T]
 
     def __str__(self):
         return "LogAbsDet"
