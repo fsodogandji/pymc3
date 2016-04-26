@@ -5,9 +5,10 @@ Created on Mar 12, 2011
 @author: johnsalvatier
 '''
 import numpy as np
-from ..core import *
-from ..model import ObservedRV
+from ..core import modelcontext, inputvars
+from ..model import ObservedRV, TransformedRV
 from ..vartypes import discrete_types
+from ..blocking import ArrayOrdering, DictToArrayBijection
 
 import theano
 from ..theanof import make_shared_replacements, join_nonshared_inputs, CallableTensor, gradient
@@ -297,3 +298,270 @@ def adagrad(grad, param, learning_rate, epsilon, n):
     updates[param] = param - (-learning_rate * grad /
                               theano.tensor.sqrt(accu_sum + epsilon))
     return updates
+
+def logp_t(model, minibatch_scale):
+    if minibatch_scale is not None:
+        minibatch_RVs = set(minibatch_scale.keys())
+        other_RVs = set(model.basic_RVs) - set(minibatch_RVs)
+    else:
+        minibatch_RVs = []
+        other_RVs = model.basic_RVs
+
+    factors = [minibatch_scale[var] * var.logpt for var in minibatch_RVs] + \
+              [var.logpt for var in other_RVs] + model.potentials
+    logpt = tt.add(*map(tt.sum, factors))
+
+    return logpt
+
+class ADVI(object):
+    """Automatic differentiation variational inference step. 
+
+    This class specifies the details of ADVI: the random variables on which the 
+    optimization performed, the number of updates for variational parameters, 
+    mini-batches fed into the optimization algorithm. 
+
+    Parameters
+    ----------
+    model : pymc3.Model
+        Probabilistic model. 
+    vars : list
+        List of random variables for which variational posteriors are estimated. 
+    vars_update : list
+        List of random variables for which variational parameters are updated. 
+        All random variables in this should be included in vars. 
+    n_iter_grad : int
+        Number of parameter updates in each ADVI step. 
+    n_mcsamples : int
+        Number of Monte Carlo samples to approximate ELBO. 
+    minibatch : object
+        Mini-batch object. It should have appropriate interface. 
+    minibatch_scale : dict \{var : float\}
+        Scales of log-probabilities of random variables in the model. 
+        That are used to correct the number of samples in each mini-batch. 
+        Tentatively, it is set to (# of whole samples) / (mini-batch size).
+    learning_rate : float
+        Learning rate for Adagrad. 
+    epsilon : float
+        Adagrad parameter. 
+    n_window : int
+        Adagrad parameter. 
+    seed : int of None
+        Seed of random number generator. 
+    """
+    def __init__(
+        self, model=None, start=None, vars=None, vars_update=None, 
+        n_iter_advi=10, n_mcsamples=1, minibatch=None, minibatch_scale=None, 
+        learning_rate=.001, epsilon=.1, n_window=10, seed=None):
+        self.model = model
+        self.seed = seed if type(seed) is int else 12345
+        self.n_mcsamples = n_mcsamples
+        self.minibatch = minibatch
+        self.minibatch_scale = minibatch_scale
+        self.n_iter_advi = n_iter_advi
+
+        theano.config.compute_test_value = 'ignore'
+
+        model = modelcontext(model)
+        if start is None:
+            start = model.test_point
+
+        # RVs approximated with variational posteriors
+        if vars is None:
+            vars = model.vars
+        vars = inputvars(vars)
+
+        check_discrete_rvs(vars)
+
+        # RVs updated by this instance
+        if vars_update is None:
+            vars_update = vars
+        vars_update = inputvars(vars_update)
+
+        # RVs not update by this instance
+        shared = make_shared_replacements(vars, model)
+        for var, share in shared.items():
+            share.set_value(start[str(var)])
+
+        # inarray : joined random variables
+        logpt = logp_t(model, minibatch_scale)
+        [logp], inarray = join_nonshared_inputs([logpt], vars, shared, make_shared=True)
+
+        # Initialize Variational parameters
+        ordering = ArrayOrdering(vars)
+        bij = DictToArrayBijection(ordering, start)
+        u_start = bij.map(start)
+        w_start = np.zeros_like(u_start)
+        uw_start = np.concatenate([u_start, w_start])
+        uw_shared = theano.shared(uw_start, 'uw_shared')
+
+        # Make the mask for gradient vector
+        m = np.zeros_like(u_start)
+        vars_update_ = [str(var) for var in vars_update]
+        for var, slc, _, _ in ordering.vmap:
+            if var in vars_update_:
+                m[slc] = 1.
+        mask = theano.shared(np.concatenate([m, m]), 'mask')
+
+        # Make tensors of variational parameters
+        uw = dvector('uw')
+        uw.tag.test_value = np.concatenate([inarray.tag.test_value,
+                                            inarray.tag.test_value])
+        elbo = elbo_t(logp, uw, inarray, n_mcsamples=n_mcsamples, seed=seed)
+        grad = gradient(elbo, [uw]) * mask
+
+        # Create in-place update function
+        grad = theano.clone(grad, { uw : uw_shared }, strict=False)
+        elbo = theano.clone(elbo, { uw : uw_shared }, strict=False)
+        updates = adagrad(
+            grad, uw_shared, learning_rate=learning_rate, epsilon=epsilon, 
+            n=n_window)
+        f = theano.function([], elbo, updates=updates)
+
+        self.ordering = ordering
+        self.shared = shared
+        self.uw_shared = uw_shared
+        self.inarray = inarray
+        self.f = f
+
+    def step(self, point, vparams):
+        """Performe ADVI parameter updates. 
+        """
+        bij = DictToArrayBijection(self.ordering, point)
+
+        # Set random variables not updated by this method
+        for var, share in self.shared.items():
+            share.container.storage[0] = point[str(var)]
+
+        # Set variational parameters
+        l = int(len(self.uw_shared.get_value()) / 2)
+        if vparams is not None:
+            self.uw_shared.set_value(
+                np.hstack((bij.map(vparams['means']), bij.map(vparams['stds'])))
+            )
+
+        # Replace observations and variational parameters
+        if self.minibatch is not None:
+            # Prepare the next mini-batch
+            self.minibatch.prepare_next()
+
+            # Set observed values to shared variables
+            for t in self.minibatch.observed_tensors:
+                t.set_value(self.minibatch.get_observation(t))
+
+            # Set variational parameters of the mini-batch
+            for var, slc, _, _ in self.ordering.vmap:
+                if var in self.minibatch.latent_vars:
+                    u, w = self.minibatch.get_variational_params(var)
+                    self.u_shared[slc] = u
+                    self.w_shared[slc] = w
+
+        # Perform ADVI steps
+        elbos = []
+        for i in range(self.n_iter_advi):
+            elbos.append(self.f().ravel())
+        elbos = np.array(elbos).ravel()
+
+        # Store variational parameters for latent variables back to minibatch
+        if self.minibatch is not None:
+            for var, slc, shp, dtyp in self.ordering.vmap:
+                if var in self.minibatch.latent_vars:
+                    u = np.atleast_1d(self.u_shared)[slc].reshape(shp).astype(dtyp)
+                    w = np.atleast_1d(self.w_shared)[slc].reshape(shp).astype(dtyp)
+                    self.minibatch.set_variational_params(var, u, w)
+
+        uw = self.uw_shared.get_value()
+        self.point = point
+        vparams = {
+            'means': bij.rmap(uw[:l]), 
+            'stds': bij.rmap(uw[l:]), 
+        }
+
+        return bij.rmap(np.array(self.inarray.get_value())), vparams, elbos
+
+def optimize_vparams(n_iter, steps, start, vparams=None, exp_std=False):
+    """Optimize variational parameters. 
+
+    Parameters
+    ----------
+    n_iter : int
+        Number of iterations of ADVI steps. If each ADVI step updates parameters
+        n_iter_advi times, the total number of parameter updates is 
+        n_iter * n_iter_advi. 
+    steps : list
+        ADVI steps. 
+    start : dict
+        Initial values of random variables. These values are ignored for the 
+        random variables approximated with variational posteriors. 
+    vparams : dict or None (default)
+        Variational parameters. 
+    exp_std : bool (default to False)
+        If true, the returned values of the stds of the variational posteriors 
+        are exponentiated. It should be False when using the variational 
+        parameters in other calculations (e.g., sample_vp()). 
+
+    Returns
+    -------
+
+    """
+    elbos = []
+    point = start
+
+    for i in range(n_iter):
+        for step in steps:
+            point, vparams, elbo = step.step(point, vparams)
+            elbos.append(elbo)
+
+    u = vparams['means']
+    w = vparams['stds']
+
+    if exp_std:
+        w = {k: np.exp(v) for k, v in w.items()}
+
+    return ADVIFit(u, w, elbos)
+
+def sample_vpost(n_samples, vars, vparams, seed=1):
+    """Draw samples from variational posterior. 
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of random samples. 
+    vars : list of random variables
+        Random variables for which samples are drawn.
+    vparams : dict or ADVIFit
+        Variational parameters of the model. It should contain all variational 
+        parameters in the model. 
+    seed : int
+        Seed of random number generator. 
+
+    Returns
+    -------
+    samples_ : dict
+        Random samples. 
+    """
+    if type(vparams) is ADVIFit:
+        vparams = {
+            'means': vparams.means, 
+            'stds': vparams.stds
+        }
+
+    r = MRG_RandomStreams(seed=seed)
+    samples = []
+    for var in vars:
+        var_ = var.transformed if isinstance(var, TransformedRV) else var
+        u = theano.shared(vparams['means'][str(var_)]).ravel()
+        w = theano.shared(vparams['stds'][str(var_)]).ravel()
+        n = r.normal(size=u.tag.test_value.shape)
+        var = theano.clone(var, {var_: (n * tt.exp(w) + u).reshape(var_.tag.test_value.shape)})
+        samples.append(var)
+    f = theano.function([], samples)
+    
+    samples = []
+    for i in range(n_samples):
+        samples.append(f())
+        
+    samples_ = {}
+    for i, var in enumerate(vars):
+        samples_.update({str(var): np.stack([sample[i] for sample in samples], axis=0)})
+        
+    return samples_
