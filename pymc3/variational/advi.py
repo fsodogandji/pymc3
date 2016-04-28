@@ -396,9 +396,9 @@ class ADVI(object):
 
         # Make the mask for gradient vector
         m = np.zeros_like(u_start)
-        vars_update_ = [str(var) for var in vars_update]
-        for var, slc, _, _ in ordering.vmap:
-            if var in vars_update_:
+        varnames_update_ = [str(var) for var in vars_update]
+        for varname, slc, _, _ in ordering.vmap:
+            if varname in varnames_update_:
                 m[slc] = 1.
         mask = theano.shared(np.concatenate([m, m]), 'mask')
 
@@ -439,6 +439,9 @@ class ADVI(object):
                 np.hstack((bij.map(vparams['means']), bij.map(vparams['stds'])))
             )
 
+        u_shared = self.uw_shared[:l]
+        w_shared = self.uw_shared[l:]
+
         # Replace observations and variational parameters
         if self.minibatch is not None:
             # Prepare the next mini-batch
@@ -449,11 +452,11 @@ class ADVI(object):
                 t.set_value(self.minibatch.get_observation(t))
 
             # Set variational parameters of the mini-batch
-            for var, slc, _, _ in self.ordering.vmap:
-                if var in self.minibatch.latent_vars:
-                    u, w = self.minibatch.get_variational_params(var)
-                    self.u_shared[slc] = u
-                    self.w_shared[slc] = w
+            for varname, slc, _, _ in self.ordering.vmap:
+                if varname in self.minibatch.latent_varnames:
+                    u, w = self.minibatch.get_variational_params(varname)
+                    tt.set_subtensor(u_shared[slc], tt.as_tensor_variable(u))
+                    tt.set_subtensor(w_shared[slc], tt.as_tensor_variable(w))
 
         # Perform ADVI steps
         elbos = []
@@ -463,11 +466,14 @@ class ADVI(object):
 
         # Store variational parameters for latent variables back to minibatch
         if self.minibatch is not None:
-            for var, slc, shp, dtyp in self.ordering.vmap:
-                if var in self.minibatch.latent_vars:
-                    u = np.atleast_1d(self.u_shared)[slc].reshape(shp).astype(dtyp)
-                    w = np.atleast_1d(self.w_shared)[slc].reshape(shp).astype(dtyp)
-                    self.minibatch.set_variational_params(var, u, w)
+            uw = self.uw_shared.get_value()
+            u = np.atleast_1d(uw[:l])
+            w = np.atleast_1d(uw[l:])
+            for varname, slc, shp, dtyp in self.ordering.vmap:
+                if varname in self.minibatch.latent_varnames:
+                    u_ = u[slc].reshape(shp).astype(dtyp)
+                    w_ = w[slc].reshape(shp).astype(dtyp)
+                    self.minibatch.set_variational_params(varname, u_, w_)
 
         uw = self.uw_shared.get_value()
         self.point = point
