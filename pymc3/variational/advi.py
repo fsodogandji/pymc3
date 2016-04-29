@@ -278,26 +278,36 @@ def elbo_t(logp, uw, inarray, n_mcsamples, seed):
 
     return elbo
 
-def adagrad(grad, param, learning_rate, epsilon, n):
+def adagrad(grad, param, learning_rate, epsilon, n, ret_accu=False):
     """Create Theano parameter (tensor) updates by Adagrad. 
     """
-    # Compute windowed adagrad using last n gradients
-    i = theano.shared(np.array(0), 'i')
-    value = param.get_value(borrow=True)
-    accu = theano.shared(np.zeros(value.shape+(n,), dtype=value.dtype))
-
-    # Append squared gradient vector to accu_new
-    accu_new = theano.tensor.set_subtensor(accu[:,i], grad ** 2)
-    i_new = theano.tensor.switch((i + 1) < n, i + 1, 0)
-
     updates = OrderedDict()
-    updates[accu] = accu_new
-    updates[i] = i_new
 
-    accu_sum = accu_new.sum(axis=1)
-    updates[param] = param - (-learning_rate * grad /
-                              theano.tensor.sqrt(accu_sum + epsilon))
-    return updates
+    if n == 0:
+        updates[param] = param - (-learning_rate * grad)
+        accu = None
+    else:
+        # Compute windowed adagrad using last n gradients
+        i = theano.shared(np.array(0), 'i')
+        value = param.get_value(borrow=True)
+        accu = theano.shared(
+            np.zeros(value.shape+(n,), dtype=value.dtype), borrow=True)
+
+        # Append squared gradient vector to accu_new
+        accu_new = theano.tensor.set_subtensor(accu[:,i], grad ** 2)
+        i_new = theano.tensor.switch((i + 1) < n, i + 1, 0)
+
+        updates[accu] = accu_new
+        updates[i] = i_new
+
+        accu_sum = accu_new.sum(axis=1)
+        updates[param] = param - (-learning_rate * grad /
+                                  theano.tensor.sqrt(accu_sum + epsilon))
+
+    if ret_accu:
+        return updates, accu
+    else:
+        return updates
 
 def logp_t(model, minibatch_scale):
     if minibatch_scale is not None:
@@ -412,9 +422,9 @@ class ADVI(object):
         # Create in-place update function
         grad = theano.clone(grad, { uw : uw_shared }, strict=False)
         elbo = theano.clone(elbo, { uw : uw_shared }, strict=False)
-        updates = adagrad(
+        updates, accu = adagrad(
             grad, uw_shared, learning_rate=learning_rate, epsilon=epsilon, 
-            n=n_window)
+            n=n_window, ret_accu=True)
         f = theano.function([], elbo, updates=updates)
 
         self.ordering = ordering
@@ -422,11 +432,16 @@ class ADVI(object):
         self.uw_shared = uw_shared
         self.inarray = inarray
         self.f = f
+        self.accu = accu
 
     def step(self, point, vparams):
         """Performe ADVI parameter updates. 
         """
         bij = DictToArrayBijection(self.ordering, point)
+
+        # Reset accumulator for Adagrad
+        if self.accu is not None:
+            self.accu.get_value(borrow=True)[:] = 0.
 
         # Set random variables not updated by this method
         for var, share in self.shared.items():
@@ -439,8 +454,7 @@ class ADVI(object):
                 np.hstack((bij.map(vparams['means']), bij.map(vparams['stds'])))
             )
 
-        u_shared = self.uw_shared[:l]
-        w_shared = self.uw_shared[l:]
+        uw_borrow = self.uw_shared.get_value(borrow=True)
 
         # Replace observations and variational parameters
         if self.minibatch is not None:
@@ -455,8 +469,8 @@ class ADVI(object):
             for varname, slc, _, _ in self.ordering.vmap:
                 if varname in self.minibatch.latent_varnames:
                     u, w = self.minibatch.get_variational_params(varname)
-                    tt.set_subtensor(u_shared[slc], tt.as_tensor_variable(u))
-                    tt.set_subtensor(w_shared[slc], tt.as_tensor_variable(w))
+                    uw_borrow[:l][slc] = u
+                    uw_borrow[l:][slc] = w
 
         # Perform ADVI steps
         elbos = []
