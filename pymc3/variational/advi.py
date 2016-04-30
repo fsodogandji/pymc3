@@ -448,7 +448,7 @@ class ADVI(object):
             share.container.storage[0] = point[str(var)]
 
         # Set variational parameters
-        l = int(len(self.uw_shared.get_value()) / 2)
+        l = int(len(self.uw_shared.get_value(borrow=True)) / 2)
         if vparams is not None:
             self.uw_shared.set_value(
                 np.hstack((bij.map(vparams['means']), bij.map(vparams['stds'])))
@@ -480,7 +480,7 @@ class ADVI(object):
 
         # Store variational parameters for latent variables back to minibatch
         if self.minibatch is not None:
-            uw = self.uw_shared.get_value()
+            uw = self.uw_shared.get_value(borrow=True)
             u = np.atleast_1d(uw[:l])
             w = np.atleast_1d(uw[l:])
             for varname, slc, shp, dtyp in self.ordering.vmap:
@@ -489,7 +489,7 @@ class ADVI(object):
                     w_ = w[slc].reshape(shp).astype(dtyp)
                     self.minibatch.set_variational_params(varname, u_, w_)
 
-        uw = self.uw_shared.get_value()
+        uw = self.uw_shared.get_value(borrow=True)
         self.point = point
         vparams = {
             'means': bij.rmap(uw[:l]), 
