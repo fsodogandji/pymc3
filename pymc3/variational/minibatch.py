@@ -2,8 +2,8 @@ import numpy as np
 from pymc3.model import TransformedRV
 from ..core import inputvars
 
-class RandomizedMinibatch(object):
-    """Mini-batch with random sampling. 
+class ADVIMinibatch(object):
+    """Mini-batch for ADVI. 
 
     This class prepares a buffer for variational parameters of the given 
     latent variables. 
@@ -29,6 +29,7 @@ class RandomizedMinibatch(object):
         self.minibatch_size = minibatch_size
         self.transpose_varnames = [str(v) for v in inputvars(transpose_vars)]
         self.rng = np.random.RandomState(seed)
+        self.ixs = None
 
         # Check total size of data
         assert(all([v.shape[0] == self.total_size for v in self.data.values()]))
@@ -46,7 +47,7 @@ class RandomizedMinibatch(object):
     def prepare_next(self):
         """Prepare next mini-batch. 
         """
-        self.ixs = self.rng.permutation(self.total_size)[:self.minibatch_size]
+        pass
 
     def get_observation(self, tensor):
         return self.data[tensor][self.ixs]
@@ -67,3 +68,29 @@ class RandomizedMinibatch(object):
 
         u_[self.ixs] = u.T if transpose else u
         w_[self.ixs] = w.T if transpose else w
+
+class RandomizedMinibatch(ADVIMinibatch):
+    def prepare_next(self):
+        """Prepare next mini-batch. 
+        """
+        self.ixs = self.rng.permutation(self.total_size)[:self.minibatch_size]
+
+class SequentialMinibatch(ADVIMinibatch):
+    def prepare_next(self):
+        """Prepare next mini-batch. 
+        """
+        if self.ixs is None:
+            self.ixs = np.arange(self.minibatch_size).astype(int)
+        else:
+            start = self.ixs[-1] + 1
+            start = 0 if self.total_size == start else start
+
+            if (start + self.minibatch_size) <= self.total_size:
+                self.ixs = np.arange(
+                    start, start + self.minibatch_size, dtype=int)
+            else:
+                ixs1 = np.arange(start, self.total_size, dtype=int)
+                ixs2 = np.arange(
+                    0, self.minibatch_size - (self.total_size - start), 
+                    dtype=int)
+                self.ixs = np.hstack((ixs1, ixs2))
