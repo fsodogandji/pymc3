@@ -195,3 +195,57 @@ class Circular(ElemwiseTransform):
         return x
 
 circular = Circular()
+
+
+a = 0.999999
+b = (1 - a) / 2
+
+# inverse_logit = T.nnet.sigmoid
+inverse_truncated_logit = lambda x: a * T.nnet.sigmoid(x) + b
+
+def truncated_logit(x):
+    # return T.log(x/(1-x))
+    return T.log((x - b)/(a - (x - b)))
+
+class TruncatedStickBreaking(Transform):
+    """Transforms K dimensional simplex space (values in [0,1] and sum to 1) to K - 1 vector of real values.
+
+    Primarily borrowed from the STAN implementation.
+    """
+
+    name = "truncatedstickbreaking"
+
+    def forward(self, x):
+        # reverse cumsum
+        x0 = x[:-1]
+        s = T.extra_ops.cumsum(x0[::-1], 0)[::-1] + x[-1]
+        z = x0/s
+        Km1 = x.shape[0] - 1
+        k = T.arange(Km1)[(slice(None), ) + (None, ) * (x.ndim - 1)]
+        eq_share = - T.log(Km1 - k)   # logit(1./(Km1 + 1 - k))
+        y = truncated_logit(z) - eq_share
+        return y
+
+    def backward(self, y):
+        Km1 = y.shape[0]
+        k = T.arange(Km1)[(slice(None), ) + (None, ) * (y.ndim - 1)]
+        eq_share = - T.log(Km1 - k)   # logit(1./(Km1 + 1 - k))
+        z = inverse_truncated_logit(y + eq_share)
+        yl = T.concatenate([z, T.ones(y[:1].shape)])
+        yu = T.concatenate([T.ones(y[:1].shape), 1-z])
+        S = T.extra_ops.cumprod(yu, 0)
+        x = S * yl
+        return x
+
+    def jacobian_det(self, y):
+        Km1 = y.shape[0]
+        k = T.arange(Km1)[(slice(None), ) + (None, ) * (y.ndim - 1)]
+        eq_share = -T.log(Km1 - k)  # logit(1./(Km1 + 1 - k))
+        yl = y + eq_share
+        yu = T.concatenate([T.ones(y[:1].shape), 1-inverse_truncated_logit(yl)])
+        S = T.extra_ops.cumprod(yu, 0)
+        return T.sum(T.log(S[:-1]) - T.log1p(T.exp(yl)) - T.log1p(T.exp(-yl)),
+                     0)
+
+truncated_stick_breaking = TruncatedStickBreaking()
+
