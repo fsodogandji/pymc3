@@ -439,9 +439,9 @@ class ADVI(object):
         """
         bij = DictToArrayBijection(self.ordering, point)
 
-        # Reset accumulator for Adagrad
-        if self.accu is not None:
-            self.accu.get_value(borrow=True)[:] = 0.
+        # # Reset accumulator for Adagrad
+        # if self.accu is not None:
+        #     self.accu.get_value(borrow=True)[:] = 0.
 
         # Set random variables not updated by this method
         for var, share in self.shared.items():
