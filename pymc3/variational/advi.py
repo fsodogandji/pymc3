@@ -263,7 +263,7 @@ def variational_gradient_estimate(
     factors = [r * var.logpt for var in minibatch_RVs] + \
               [var.logpt for var in other_RVs] + model.potentials
     logpt = tt.add(*map(tt.sum, factors))
-    
+
     [logp], inarray = join_nonshared_inputs([logpt], vars, shared)
 
     uw = dvector('uw')
@@ -325,7 +325,8 @@ def adagrad(grad, param, learning_rate, epsilon, n):
                               theano.tensor.sqrt(accu_sum + epsilon))
     return updates
 
-def sample_vp(vparams, draws=1000, model=None, random_seed=20090425):
+def sample_vp(
+    vparams, draws=1000, model=None, local_RVs=None, random_seed=20090425):
     """Draw samples from variational posterior. 
 
     Parameters
@@ -352,17 +353,33 @@ def sample_vp(vparams, draws=1000, model=None, random_seed=20090425):
             'stds': vparams.stds
         }
 
+    ds = model.deterministics
+    get_transformed = lambda v: v if v not in ds else v.transformed
+    rvs = lambda x: [get_transformed(v) for v in x] if x is not None else []
+
+    global_RVs = list(set(model.free_RVs) - set(rvs(local_RVs)))
+
     # Make dict for replacements of random variables
     r = MRG_RandomStreams(seed=random_seed)
     updates = {}
-    for var in model.free_RVs:
-        u = theano.shared(vparams['means'][str(var)]).ravel()
-        w = theano.shared(vparams['stds'][str(var)]).ravel()
+    for v in global_RVs:
+        u = theano.shared(vparams['means'][str(v)]).ravel()
+        w = theano.shared(vparams['stds'][str(v)]).ravel()
         n = r.normal(size=u.tag.test_value.shape)
-        updates.update({var: (n * w + u).reshape(var.tag.test_value.shape)})
-    vars = model.free_RVs
-        
+        updates.update({v: (n * w + u).reshape(v.tag.test_value.shape)})
+
+    if local_RVs is not None:
+        ds = model.deterministics
+        get_transformed = lambda v: v if v not in ds else v.transformed
+        for v_, (uw, _) in local_RVs.items():
+            v = get_transformed(v_)
+            u = uw[0].ravel()
+            w = uw[1].ravel()
+            n = r.normal(size=u.tag.test_value.shape)
+            updates.update({v: (n * tt.exp(w) + u).reshape(v.tag.test_value.shape)})
+
     # Replace some nodes of the graph with variational distributions
+    vars = model.free_RVs
     samples = theano.clone(vars, updates)
     f = theano.function([], samples)
 
